@@ -90,8 +90,8 @@ enum Command {
     Logout,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+    #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nexus_environment_str = std::env::var("NEXUS_ENVIRONMENT").unwrap_or_default();
     let environment = nexus_environment_str
         .parse::<Environment>()
@@ -255,7 +255,7 @@ async fn start(
     let signing_key: SigningKey = SigningKey::generate(&mut csprng);
     let orchestrator_client = OrchestratorClient::new(env.clone());
     // Clamp the number of workers to [1,8]. Keep this low for now to avoid rate limiting.
-    let num_workers: usize = max_threads.unwrap_or(1).clamp(1, 8) as usize;
+    let num_workers: usize = max_threads.unwrap_or(8).clamp(1, 8) as usize;
     let (shutdown_sender, _) = broadcast::channel(1); // Only one shutdown signal needed
 
     // Get client_id for analytics - use wallet address from API if available, otherwise "anonymous"
