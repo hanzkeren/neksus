@@ -6,6 +6,7 @@ use nexus_sdk::Verifiable;
 use nexus_sdk::stwo::seq::Proof;
 use nexus_sdk::{KnownExitCodes, Local, Prover, Viewable, stwo::seq::Stwo};
 use thiserror::Error;
+use tokio::task::spawn_blocking;
 
 #[derive(Error, Debug)]
 pub enum ProverError {
@@ -23,6 +24,7 @@ pub enum ProverError {
 }
 
 /// Proves a program locally with hardcoded inputs.
+/// Heavy compute is moved to `spawn_blocking` so it can fully use CPU cores.
 pub async fn prove_anonymously() -> Result<Proof, ProverError> {
     // Compute the 10th Fibonacci number using fib_input_initial
     // Input: (n=9, init_a=1, init_b=1)
@@ -30,109 +32,101 @@ pub async fn prove_anonymously() -> Result<Proof, ProverError> {
     // Sequence: F(0)=1, F(1)=1, F(2)=2, F(3)=3, F(4)=5, F(5)=8, F(6)=13, F(7)=21, F(8)=34, F(9)=55
     let public_input: (u32, u32, u32) = (9, 1, 1);
 
-    // Use the new initial ELF file for anonymous proving
-    let stwo_prover = get_initial_stwo_prover()?;
-    let (view, proof) = stwo_prover
-        .prove_with_input::<(), (u32, u32, u32)>(&(), &public_input)
-        .map_err(|e| {
-            ProverError::Stwo(format!(
-                "Failed to run fib_input_initial prover (anonymous): {}",
-                e
-            ))
+    // Run proving on blocking pool (CPU-bound)
+    let public_input_cl = public_input.clone();
+    let proves_task = spawn_blocking(move || -> Result<(u32, Proof), ProverError> {
+        let stwo_prover = get_initial_stwo_prover()?;
+        let (view, proof) = stwo_prover
+            .prove_with_input::<(), (u32, u32, u32)>(&(), &public_input_cl)
+            .map_err(|e| {
+                ProverError::Stwo(format!(
+                    "Failed to run fib_input_initial prover (anonymous): {e}"
+                ))
+            })?;
+
+        let exit_code = view.exit_code().map_err(|e| {
+            ProverError::GuestProgram(format!("Failed to deserialize exit code: {e}"))
         })?;
 
-    let exit_code = view.exit_code().map_err(|e| {
-        ProverError::GuestProgram(format!("Failed to deserialize exit code: {}", e))
-    })?;
+        Ok((exit_code, proof))
+    });
+
+    // Join blocking result
+    let (exit_code, proof) = proves_task
+        .await
+        .map_err(|e| ProverError::GuestProgram(format!("join error: {e}")))??;
 
     if exit_code != KnownExitCodes::ExitSuccess as u32 {
         return Err(ProverError::GuestProgram(format!(
-            "Prover exited with non-zero exit code: {}",
-            exit_code
+            "Prover exited with non-zero exit code: {exit_code}"
         )));
     }
 
     Ok(proof)
 }
 
-/// Proves a program with a given node ID
+/// Proves a program with a given node ID.
+/// Heavy compute is moved to `spawn_blocking` and proof is verified before returning.
 pub async fn authenticated_proving(
     task: &Task,
     environment: &Environment,
     client_id: &str,
 ) -> Result<Proof, ProverError> {
-    let (view, proof, _) = match task.program_id.as_str() {
+    let (exit_code, proof, verify_input, elf_for_verify) = match task.program_id.as_str() {
         "fast-fib" => {
-            // fast-fib uses string inputs
+            // fast-fib uses a single u32 input (derived from public input bytes)
             let input = get_string_public_input(task)?;
+
+            // Build prover on async thread, but run compute in blocking pool.
             let stwo_prover = get_default_stwo_prover()?;
             let elf = stwo_prover.elf.clone();
-            let (view, proof) = stwo_prover
-                .prove_with_input::<(), u32>(&(), &input)
-                .map_err(|e| ProverError::Stwo(format!("Failed to run fast-fib prover: {}", e)))?;
-            // We should verify the proof before returning it to the server
-            // otherwise, the orchestrator can punish the worker for returning an invalid proof
-            match proof.verify_expected(
-                &input,
-                nexus_sdk::KnownExitCodes::ExitSuccess as u32,
-                &(),
-                &elf,
-                &[],
-            ) {
-                Ok(_) => {
-                    // Track analytics for proof validation success (non-blocking)
-                }
-                Err(e) => {
-                    let error_msg =
-                        format!("Failed to verify proof: {} for inputs: {:?}", e, input);
-                    // Track analytics for verification failure (non-blocking)
-                    tokio::spawn(track_verification_failed(
-                        task.clone(),
-                        error_msg.clone(),
-                        environment.clone(),
-                        client_id.to_string(),
-                    ));
-                    return Err(ProverError::Stwo(error_msg));
-                }
-            }
-            (view, proof, input)
+
+            let proves_task = spawn_blocking(move || -> Result<(u32, Proof), ProverError> {
+                let (view, proof) = stwo_prover
+                    .prove_with_input::<(), u32>(&(), &input)
+                    .map_err(|e| ProverError::Stwo(format!("Failed to run fast-fib prover: {e}")))?;
+
+                let exit_code = view.exit_code().map_err(|e| {
+                    ProverError::GuestProgram(format!("Failed to deserialize exit code: {e}"))
+                })?;
+                Ok((exit_code, proof))
+            });
+
+            let (exit_code, proof) = proves_task
+                .await
+                .map_err(|e| ProverError::GuestProgram(format!("join error: {e}")))??;
+
+            (exit_code, proof, InputForVerify::U32(input), elf)
         }
+
         "fib_input_initial" => {
+            // three u32 inputs
             let inputs = get_triple_public_input(task)?;
+
             let stwo_prover = get_initial_stwo_prover()?;
             let elf = stwo_prover.elf.clone();
-            let (view, proof) = stwo_prover
-                .prove_with_input::<(), (u32, u32, u32)>(&(), &inputs)
-                .map_err(|e| {
-                    ProverError::Stwo(format!("Failed to run fib_input_initial prover: {}", e))
+
+            let inputs_cl = inputs.clone();
+            let proves_task = spawn_blocking(move || -> Result<(u32, Proof), ProverError> {
+                let (view, proof) = stwo_prover
+                    .prove_with_input::<(), (u32, u32, u32)>(&(), &inputs_cl)
+                    .map_err(|e| {
+                        ProverError::Stwo(format!("Failed to run fib_input_initial prover: {e}"))
+                    })?;
+
+                let exit_code = view.exit_code().map_err(|e| {
+                    ProverError::GuestProgram(format!("Failed to deserialize exit code: {e}"))
                 })?;
-            // We should verify the proof before returning it to the server
-            // otherwise, the orchestrator can punish the worker for returning an invalid proof
-            match proof.verify_expected::<(u32, u32, u32), ()>(
-                &inputs, // three u32 inputs
-                nexus_sdk::KnownExitCodes::ExitSuccess as u32,
-                &(),  // no public output
-                &elf, // expected elf (program binary)
-                &[],  // no associated data,
-            ) {
-                Ok(_) => {
-                    // Track analytics for proof validation success (non-blocking)
-                }
-                Err(e) => {
-                    let error_msg =
-                        format!("Failed to verify proof: {} for inputs: {:?}", e, inputs);
-                    // Track analytics for verification failure (non-blocking)
-                    tokio::spawn(track_verification_failed(
-                        task.clone(),
-                        error_msg.clone(),
-                        environment.clone(),
-                        client_id.to_string(),
-                    ));
-                    return Err(ProverError::Stwo(error_msg));
-                }
-            }
-            (view, proof, inputs.0)
+                Ok((exit_code, proof))
+            });
+
+            let (exit_code, proof) = proves_task
+                .await
+                .map_err(|e| ProverError::GuestProgram(format!("join error: {e}")))??;
+
+            (exit_code, proof, InputForVerify::Triple(inputs), elf)
         }
+
         _ => {
             return Err(ProverError::MalformedTask(format!(
                 "Unsupported program ID: {}",
@@ -141,18 +135,60 @@ pub async fn authenticated_proving(
         }
     };
 
-    let exit_code = view.exit_code().map_err(|e| {
-        ProverError::GuestProgram(format!("Failed to deserialize exit code: {}", e))
-    })?;
-
+    // Check program exit code
     if exit_code != KnownExitCodes::ExitSuccess as u32 {
         return Err(ProverError::GuestProgram(format!(
-            "Prover exited with non-zero exit code: {}",
-            exit_code
+            "Prover exited with non-zero exit code: {exit_code}"
         )));
     }
 
+    // Verify proof before returning (to avoid orchestrator penalty)
+    match verify_input {
+        InputForVerify::U32(n) => {
+            if let Err(e) = proof.verify_expected::<u32, ()>(
+                &n,
+                KnownExitCodes::ExitSuccess as u32,
+                &(),
+                &elf_for_verify,
+                &[],
+            ) {
+                let error_msg = format!("Failed to verify proof: {e} for inputs: {n}");
+                tokio::spawn(track_verification_failed(
+                    task.clone(),
+                    error_msg.clone(),
+                    environment.clone(),
+                    client_id.to_string(),
+                ));
+                return Err(ProverError::Stwo(error_msg));
+            }
+        }
+        InputForVerify::Triple((a, b, c)) => {
+            if let Err(e) = proof.verify_expected::<(u32, u32, u32), ()>(
+                &(a, b, c),
+                KnownExitCodes::ExitSuccess as u32,
+                &(),
+                &elf_for_verify,
+                &[],
+            ) {
+                let error_msg =
+                    format!("Failed to verify proof: {e} for inputs: ({a}, {b}, {c})");
+                tokio::spawn(track_verification_failed(
+                    task.clone(),
+                    error_msg.clone(),
+                    environment.clone(),
+                    client_id.to_string(),
+                ));
+                return Err(ProverError::Stwo(error_msg));
+            }
+        }
+    }
+
     Ok(proof)
+}
+
+enum InputForVerify {
+    U32(u32),
+    Triple((u32, u32, u32)),
 }
 
 fn get_string_public_input(task: &Task) -> Result<u32, ProverError> {
@@ -192,7 +228,7 @@ fn get_triple_public_input(task: &Task) -> Result<(u32, u32, u32), ProverError> 
 pub fn get_default_stwo_prover() -> Result<Stwo<Local>, ProverError> {
     let elf_bytes = include_bytes!("../assets/fib_input");
     Stwo::<Local>::new_from_bytes(elf_bytes).map_err(|e| {
-        let msg = format!("Failed to load fib_input guest program: {}", e);
+        let msg = format!("Failed to load fib_input guest program: {e}");
         ProverError::Stwo(msg)
     })
 }
@@ -201,7 +237,7 @@ pub fn get_default_stwo_prover() -> Result<Stwo<Local>, ProverError> {
 pub fn get_initial_stwo_prover() -> Result<Stwo<Local>, ProverError> {
     let elf_bytes = include_bytes!("../assets/fib_input_initial");
     Stwo::<Local>::new_from_bytes(elf_bytes).map_err(|e| {
-        let msg = format!("Failed to load fib_input_initial guest program: {}", e);
+        let msg = format!("Failed to load fib_input_initial guest program: {e}");
         ProverError::Stwo(msg)
     })
 }
